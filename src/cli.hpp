@@ -11,6 +11,8 @@ struct Cli
 {
     std::string dir;            // directory containing .sdf files
     std::string files;          // colon-separated list of .sdf files (subset)
+    std::string pattern;        // glob to filter directory scan (e.g.
+                                // normal_*.sdf)
     std::string outdir;         // output directory (default: dir)
     std::string name = "simData_%04T.bp"; // iteration file pattern
     std::vector<std::string> fields;  // field filter (empty = all)

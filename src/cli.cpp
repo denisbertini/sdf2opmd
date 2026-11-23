@@ -6,6 +6,8 @@
 #include <iostream>
 #include <sstream>
 
+#include <fnmatch.h>
+
 #include "cxxopts.hpp"
 
 namespace fs = std::filesystem;
@@ -43,6 +45,8 @@ Cli::parse(int argc, char * * argv)
             cxxopts::value<std::string>(cli.dir))
         ("f,files", "colon-separated .sdf file subset",
             cxxopts::value<std::string>(cli.files))
+        ("g,pattern", "glob filter for the --dir scan (e.g. normal_*.sdf)",
+            cxxopts::value<std::string>(cli.pattern))
         ("o,outdir", "output directory (default: --dir)",
             cxxopts::value<std::string>(cli.outdir))
         ("n,name", "iteration file pattern (default simData_%04T.bp)",
@@ -118,8 +122,12 @@ Cli::resolveFiles() const
         for (auto const & entry : fs::directory_iterator(dir))
         {
             auto const path = entry.path();
-            if (path.extension() == ".sdf")
-                out.push_back(path.string());
+            if (path.extension() != ".sdf")
+                continue;
+            if (!pattern.empty()
+                && fnmatch(pattern.c_str(), path.filename().c_str(), 0) != 0)
+                continue;
+            out.push_back(path.string());
         }
     }
 

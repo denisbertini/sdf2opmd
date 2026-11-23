@@ -5,7 +5,6 @@
 #include <cstring>
 #include <filesystem>
 #include <map>
-#include <optional>
 #include <set>
 #include <unordered_map>
 
@@ -160,15 +159,6 @@ applyGeom(Mesh & mesh, MeshGeom const & geom, std::string const & sdfMeshId)
     }
 }
 
-struct MeshState
-{
-    std::optional<Mesh> mesh;
-    bool staggerConsistent = true;
-    std::vector<double> position;
-    bool havePosition = false;
-    std::string sdfMeshId;
-};
-
 } // namespace
 
 void
@@ -294,10 +284,16 @@ convertFile(Series & series, SdfFile & file, std::string const & path,
         meshById[trim(m->id)] = m;
 
     /* ------------------------------------------------------------------ */
-    /* Fields: SDF plain variables -> openPMD meshes                       */
+    /* Fields: SDF plain variables -> openPMD records                      */
+    /*                                                                     */
+    /* openPMD records share extent, grid geometry and position across all */
+    /* their components. Only SDF variables with identical dims *and*      */
+    /* stagger may therefore form one vector record (e.g. a fully          */
+    /* consistent E/x,y,z). EPOCH's Yee components differ in both, so they */
+    /* come out as scalar records named by the SDF id, each carrying its   */
+    /* exact grid `position` derived from the stagger.                     */
     /* ------------------------------------------------------------------ */
-    std::map<std::string, MeshState> meshes;
-    auto const tf = now();
+    std::vector<sdf_block_t *> selected;
     for (auto * b : map.fields)
     {
         std::string const id = trim(b->id);
@@ -307,50 +303,98 @@ convertFile(Series & series, SdfFile & file, std::string const & path,
         {
             continue;
         }
+        selected.push_back(b);
+    }
 
-        FieldTarget const tgt = fieldTarget(id);
+    auto groupKey = [](sdf_block_t const * b, FieldTarget const & tgt) {
+        std::string k = tgt.mesh;
+        k += "|nd=" + std::to_string(b->ndims);
+        for (int d = 0; d < b->ndims; ++d)
+            k += "|d" + std::to_string(d) + "=" + std::to_string(b->dims[d]);
+        k += "|st=" + std::to_string(b->stagger);
+        k += "|m=" + trim(b->mesh_id);
+        return k;
+    };
+
+    std::map<std::string, std::vector<sdf_block_t *>> groups;
+    std::vector<std::string> groupOrder;
+    for (auto * b : selected)
+    {
+        std::string k = groupKey(b, fieldTarget(trim(b->id)));
+        if (!groups.count(k))
+            groupOrder.push_back(k);
+        groups[k].push_back(b);
+    }
+
+    struct PlannedField
+    {
+        std::string record;
+        std::string component; // "" == SCALAR
+        sdf_block_t * block;
+    };
+    std::vector<PlannedField> plan;
+    std::set<std::string> usedRecords;
+    for (auto const & key : groupOrder)
+    {
+        auto const & blks = groups[key];
+        FieldTarget const first = fieldTarget(trim(blks.front()->id));
+        if (!first.component.empty() && blks.size() > 1)
+        {
+            std::string rec = first.mesh;
+            if (!usedRecords.insert(rec).second)
+                rec = first.mesh + "_" + sanitize(trim(blks.front()->mesh_id));
+            for (auto * b : blks)
+                plan.push_back({rec, fieldTarget(trim(b->id)).component, b});
+        }
+        else
+        {
+            for (auto * b : blks)
+            {
+                std::string rec = sanitize(trim(b->id));
+                usedRecords.insert(rec);
+                plan.push_back({rec, "", b});
+            }
+        }
+    }
+
+    std::map<std::string, MeshGeom> geomCache;
+    auto geomFor = [&](std::string const & meshId) -> MeshGeom const & {
+        auto git = geomCache.find(meshId);
+        if (git != geomCache.end())
+            return git->second;
+        auto mit = meshById.find(meshId);
+        MeshGeom g = readMeshGeom(
+            file, mit == meshById.end() ? nullptr : mit->second);
+        return geomCache.emplace(meshId, std::move(g)).first->second;
+    };
+
+    auto const tf = now();
+    std::set<std::string> recInit;
+    for (auto const & pf : plan)
+    {
+        sdf_block_t * b = pf.block;
+        std::string const id = trim(b->id);
         std::string const sdfMeshId = trim(b->mesh_id);
 
-        std::string meshKey = tgt.mesh;
-        // same openPMD name but different SDF mesh -> keep both
-        if (meshes.count(meshKey) && meshes[meshKey].mesh.has_value()
-            && meshes[meshKey].sdfMeshId != sdfMeshId && !sdfMeshId.empty())
+        Mesh mesh = it.meshes[pf.record];
+        if (!recInit.count(pf.record))
         {
-            meshKey = tgt.mesh + "_" + sanitize(sdfMeshId);
-        }
-
-        MeshState & ms = meshes[meshKey];
-        if (!ms.mesh.has_value())
-        {
-            ms.mesh = it.meshes[meshKey];
-            ms.sdfMeshId = sdfMeshId;
-            auto mit = meshById.find(sdfMeshId);
-            MeshGeom geom = readMeshGeom(
-                file, mit == meshById.end() ? nullptr : mit->second);
-            applyGeom(*ms.mesh, geom, sdfMeshId);
-            if (std::map<UnitDimension, double> ud;
-                fieldUnitDimension(tgt.mesh, ud))
+            applyGeom(mesh, geomFor(sdfMeshId), sdfMeshId);
+            std::vector<double> pos;
+            if (staggerToPosition(b->stagger, b->ndims, pos))
+                mesh.setAttribute("position", pos);
+            std::map<UnitDimension, double> ud;
+            if (fieldUnitDimension(fieldTarget(id).mesh, ud)
+                || fieldUnitDimension(id, ud))
             {
-                ms.mesh->setUnitDimension(ud);
+                mesh.setUnitDimension(ud);
             }
+            recInit.insert(pf.record);
         }
 
-        RecordComponent & rc = (*ms.mesh)[tgt.component.empty()
+        RecordComponent & rc = mesh[pf.component.empty()
                 ? MeshRecordComponent::SCALAR
-                : tgt.component];
-
-        // grid position from stagger (consistent across components only)
-        std::vector<double> pos;
-        if (staggerToPosition(b->stagger, b->ndims, pos))
-        {
-            if (!ms.havePosition)
-            {
-                ms.position = pos;
-                ms.havePosition = true;
-            }
-            else if (ms.position != pos)
-                ms.staggerConsistent = false;
-        }
+                : pf.component];
 
         int64_t counts[SDF_MAXDIMS];
         int64_t starts[SDF_MAXDIMS];
@@ -398,13 +442,6 @@ convertFile(Series & series, SdfFile & file, std::string const & path,
     }
     timings.meta += tf - t0;
 
-    for (auto & [name, ms] : meshes)
-    {
-        (void)name;
-        if (ms.mesh.has_value() && ms.havePosition && ms.staggerConsistent)
-            ms.mesh->setAttribute("position", ms.position);
-    }
-
     {
         auto const t = now();
         series.flush();
@@ -441,11 +478,13 @@ convertFile(Series & series, SdfFile & file, std::string const & path,
         for (auto * v : sd.vars)
         {
             if (v->datatype != SDF_DATATYPE_REAL8
-                && v->datatype != SDF_DATATYPE_REAL4)
+                && v->datatype != SDF_DATATYPE_REAL4
+                && v->datatype != SDF_DATATYPE_INTEGER4
+                && v->datatype != SDF_DATATYPE_INTEGER8)
             {
                 if (rank == 0)
                     std::printf("  note: skipping particle variable '%s' "
-                                "(non-real datatype)\n",
+                                "(unsupported datatype)\n",
                         trim(v->id).c_str());
                 continue;
             }

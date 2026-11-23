@@ -59,31 +59,37 @@ validate3d(openPMD::Series & series, openPMD::Iteration & it, uint64_t step)
     checkD(it.time<double>(), double(step) * 1.5e-15, "iteration time");
     checkD(it.dt<double>(), 5e-17 / double(step), "iteration dt");
 
-    auto & ex = it.meshes["E"]["x"];
-    auto & ey = it.meshes["E"]["y"];
-    auto & bz = it.meshes["B"]["z"];
-    check(ex.getExtent() == Extent{8, 6, 5}, "extent of E/x");
-    check(ey.getExtent() == Extent{8, 6, 5}, "extent of E/y");
-    check(bz.getExtent() == Extent{8, 6, 5}, "extent of B/z");
+    // Yee components keep their SDF ids as scalar records, each with an
+    // exact grid position derived from its stagger
+    auto & ex = it.meshes["ex"];
+    auto & ey = it.meshes["ey"];
+    auto & bz = it.meshes["bz"];
+    auto const scalar = RecordComponent::SCALAR;
+    check(ex[scalar].getExtent() == Extent{8, 6, 5}, "extent of ex");
+    check(ey[scalar].getExtent() == Extent{8, 6, 5}, "extent of ey");
+    check(bz[scalar].getExtent() == Extent{8, 6, 5}, "extent of bz");
 
-    auto const dxx = ex.loadChunk<double>({0, 0, 0}, {8, 6, 5});
-    auto const dyy = ey.loadChunk<double>({0, 0, 0}, {8, 6, 5});
-    auto const dzz = bz.loadChunk<double>({0, 0, 0}, {8, 6, 5});
+    auto const dxx = ex[scalar].loadChunk<double>({0, 0, 0}, {8, 6, 5});
+    auto const dyy = ey[scalar].loadChunk<double>({0, 0, 0}, {8, 6, 5});
+    auto const dzz = bz[scalar].loadChunk<double>({0, 0, 0}, {8, 6, 5});
 
-    auto & meshE = it.meshes["E"];
     auto const spacing =
-        meshE.getAttribute("gridSpacing").get<std::vector<double>>();
+        ex.getAttribute("gridSpacing").get<std::vector<double>>();
     auto const offset =
-        meshE.getAttribute("gridGlobalOffset").get<std::vector<double>>();
+        ex.getAttribute("gridGlobalOffset").get<std::vector<double>>();
     checkV(spacing, {0.1, 0.2, 0.3}, "gridSpacing");
     checkV(offset, {0.0, 1.0, -2.0}, "gridGlobalOffset");
-    check(meshE.containsAttribute("sdf_axis_x"), "axis array attribute");
+    check(ex.containsAttribute("sdf_axis_x"), "axis array attribute");
 
+    auto const xPos =
+        ex.getAttribute("position").get<std::vector<double>>();
+    auto const yPos =
+        ey.getAttribute("position").get<std::vector<double>>();
     auto const bPos =
-        it.meshes["B"].getAttribute("position").get<std::vector<double>>();
-    checkV(bPos, {0.0, 0.0, 0.5}, "B grid position from stagger");
-    check(!meshE.containsAttribute("position"),
-        "no position attribute for inconsistent staggers");
+        bz.getAttribute("position").get<std::vector<double>>();
+    checkV(xPos, {0.5, 0.0, 0.0}, "ex grid position from stagger");
+    checkV(yPos, {0.0, 0.5, 0.0}, "ey grid position from stagger");
+    checkV(bPos, {0.0, 0.0, 0.5}, "bz grid position from stagger");
 
     auto & el = it.particles["el"];
     auto const np = el["position"]["x"].getExtent()[0];
@@ -129,6 +135,7 @@ validate2d(openPMD::Series & series, openPMD::Iteration & it, uint64_t step)
     checkD(it.time<double>(), 0.25, "2d time");
     checkD(it.dt<double>(), 1e-18, "2d dt");
 
+        // 2d fixture: ex/ey share dims+stagger -> one vector record E
     auto const ex = it.meshes["E"]["x"].loadChunk<double>({0, 0}, {4, 3});
     auto & ion = it.particles["ion"];
     auto const np = ion["position"]["x"].getExtent()[0];
