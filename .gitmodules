@@ -1,0 +1,3 @@
+[submodule "extern/sdf"]
+	path = extern/sdf
+	url = https://github.com/epochpic/SDF_C

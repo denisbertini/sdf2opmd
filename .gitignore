@@ -1,0 +1,7 @@
+build*/
+deps/
+*.bp/
+*.bp
+*.h5
+CMakeUserPresets.json
+__pycache__/
