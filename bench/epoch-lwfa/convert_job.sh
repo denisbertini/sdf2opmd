@@ -22,6 +22,23 @@
 # LD_LIBRARY_PATH=/usr/lib64 for libfabric >= FABRIC_1.10).
 #
 #   NODES=2 RANKS=64 ./convert_job.sh /path/to/dumps /path/to/output
+#
+# ---- where to write (Lustre read+write contention) ------------------------
+# Conversion reads SDF and writes BP5 at ~the same time; keep those two
+# streams off the same OSTs:
+#   * best:      dumps under /project, OUT_DIR under /work - separate Lustre
+#                instances, zero contention by construction; bbstage later
+#   * same FS:   STRIPE=<n> pins OUT_DIR to a (fresh) OST stripe set so
+#                reads and writes never share targets (Lustre inheritance:
+#                set it while OUT_DIR is empty)
+#   * small runs: single node + node-local NVMe (NODES=1, OUT_DIR under
+#                /ssd/$USER, then xrdcp/rsync to EOS). NEVER multi-node
+#                NVMe: BP5 file-based output needs one shared filesystem
+#                (a single .md per iteration), the series would fragment.
+# Engine-level write shaping goes through the openPMD -> ADIOS2 engine
+# parameter channel, e.g. fewer/parallel data files per iteration:
+#   ENGINE_JSON='{"adios2":{"engine":{"parameters":{\
+#     "Collectives":"MPI_INIT","SubFiles":"All","NumSubFiles":"16"}}}}'
 set -euo pipefail
 
 SDF_DIR=${1:?sdf dump directory}
@@ -40,12 +57,25 @@ if [[ ! -x $SDF2OPMD ]]; then
 fi
 
 mkdir -p "$OUT_DIR"
+if [[ -n ${STRIPE:-} ]] && command -v lfs >/dev/null; then
+    if [[ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ]]; then
+        echo "STRIPE set but $OUT_DIR not empty; keeping existing layout" >&2
+    else
+        lfs setstripe -c "$STRIPE" "$OUT_DIR"
+        echo "stripe of $OUT_DIR: $(lfs getstripe "$OUT_DIR" | head -2 | tail -1)"
+    fi
+elif [[ -n ${STRIPE:-} ]]; then
+    echo "WARNING: STRIPE=$STRIPE but no 'lfs' here; ignoring" >&2
+fi
+
+ENGINE_ARGS=()
+[[ -n ${ENGINE_JSON:-} ]] && ENGINE_ARGS+=(--engine "$ENGINE_JSON")
 
 time srun -n "$RANKS" "$SDF2OPMD" -p "$SDF_DIR" -g 'normal_*.sdf' \
-    -o "$OUT_DIR/simData" --name 'simData_%04T.bp'
+    -o "$OUT_DIR/simData" --name 'simData_%04T.bp' "${ENGINE_ARGS[@]}"
 
 time srun -n "$RANKS" "$SDF2OPMD" -p "$SDF_DIR" -g 'test_*.sdf' \
-    -o "$OUT_DIR/simDataTest" --name 'simData_%04T.bp'
+    -o "$OUT_DIR/simDataTest" --name 'simData_%04T.bp' "${ENGINE_ARGS[@]}"
 
 du -sh "$OUT_DIR"/simData* 2>/dev/null || true
 echo "conversion done: $OUT_DIR"
