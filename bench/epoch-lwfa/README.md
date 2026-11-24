@@ -87,6 +87,36 @@ Generates an EPOCH-like 3-step dump set (Yee staggering, moving window,
 int8 particle ids, both output-block files), converts it with 3 ranks and
 requires the two analyses to compare identical.
 
+## Memory sizing (ranks and mem-per-cpu)
+
+One file is in flight at a time, and every rank holds its ~`1/R` share of
+that file's data until the batched engine flush (fields batched, particles
+batched per species). So the peak is bounded by the **largest single file**,
+never by the series length:
+
+```
+peak RSS/rank  ~=  C  +  k * S_max / R
+   C     ~ 0.1-0.5 GiB fixed floor (openPMD + ADIOS2 + MPI runtime)
+   k     ~ 1.1-1.5 (transpose tiles, BP5 serialization, allocator slack)
+   S_max bytes of the biggest SDF file (du -s; ~= sum of r8 fields +
+         npart * nvars * 8), R = ranks
+```
+
+Consequences: doubling R halves the payload term (memory is *not* why you
+avoid many ranks); `mem-per-cpu` must cover `C + k*S_max/R` (Orion: 32
+ranks x 1960 MiB ~= 61 GiB usable per node).
+
+The converter now tells you both sides of this directly:
+* before each file: `~X MiB/rank at R ranks` (payload estimate `S/R`) - if
+  this exceeds your per-rank budget, raise the rank count;
+* at the end: `peak RSS/rank ... (max over R rank(s), mean ...)` - the true
+  high-water mark including engine and runtime.
+
+Sizing recipe: convert ONE file at your intended rank count (seconds of
+work), read the `memory:` line, set `--mem-per-cpu` to ~1.3x that. Then the
+rank choice is purely about I/O: as many ranks as saturate your Lustre
+read+write (see contention section), not more.
+
 ## Lustre read+write contention
 
 Conversion reads SDF and writes BP5 roughly simultaneously, ~1 byte out per

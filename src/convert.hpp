@@ -29,9 +29,10 @@ struct Timings
     double flush = 0;
     double total = 0;
     int files = 0;
+    double peakRssMiB = 0; // process high-water mark (per rank, max over files)
 
     void
-    print(int rank) const;
+    print(MPI_Comm comm) const;
 };
 
 openPMD::Series

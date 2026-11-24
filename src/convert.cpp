@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <map>
 #include <set>
+#include <sys/resource.h>
 #include <unordered_map>
 
 namespace fs = std::filesystem;
@@ -126,6 +127,16 @@ readMeshGeom(SdfFile & file, sdf_block_t * mb)
     return geom;
 }
 
+// process RSS high-water mark in MiB (Linux ru_maxrss is KiB)
+double
+peakRssMiB()
+{
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0)
+        return 0.0;
+    return double(ru.ru_maxrss) / 1024.0;
+}
+
 void
 applyGeom(Mesh & mesh, MeshGeom const & geom, std::string const & sdfMeshId)
 {
@@ -162,8 +173,22 @@ applyGeom(Mesh & mesh, MeshGeom const & geom, std::string const & sdfMeshId)
 } // namespace
 
 void
-Timings::print(int rank) const
+Timings::print(MPI_Comm comm) const
 {
+    int rank = 0;
+    int size = 1;
+    MPI_Comm_rank(comm, &rank);
+    MPI_Comm_size(comm, &size);
+
+    // gather honest per-rank memory high-water marks (RSS includes the
+    // allocator's arena growth: exactly what SLURM mem-per-cpu must cover)
+    double peakHere = peakRssMiB;
+    if (size > 1)
+        MPI_Allreduce(MPI_IN_PLACE, &peakHere, 1, MPI_DOUBLE, MPI_MAX, comm);
+    double peakSum = peakRssMiB;
+    if (size > 1)
+        MPI_Allreduce(MPI_IN_PLACE, &peakSum, 1, MPI_DOUBLE, MPI_SUM, comm);
+
     if (rank != 0 || files == 0)
         return;
     auto per = [this](double v) { return v / double(files); };
@@ -173,6 +198,10 @@ Timings::print(int rank) const
         "(%.3f s/file)\n",
         files, total, per(meta), per(read), per(flush),
         per(total));
+    std::printf(
+        "sdf2opmd memory: peak RSS/rank %.0f MiB (max over %d rank(s), "
+        "mean %.0f MiB)\n",
+        peakHere, size, peakSum / double(size));
 }
 
 Series
@@ -253,11 +282,22 @@ convertFile(Series & series, SdfFile & file, std::string const & path,
     auto const map = classify(file.blocks());
     if (!cli.quiet && rank == 0)
     {
-        std::printf("converting %s -> iteration %" PRIu64 " (%zu field block(s)",
+        // per-rank payload estimate: fields are batched and particles held
+        // until their flush, so one rank roughly balances total_data/nranks
+        int64_t dataBytes = 0;
+        for (auto * b : file.blocks())
+            if (b->blocktype != SDF_BLOCKTYPE_SCRUBBED)
+                dataBytes += b->data_length;
+        std::printf(
+            "converting %s -> iteration %" PRIu64
+            " (%zu field block(s)",
             path.c_str(), step, map.fields.size());
         if (!map.species.empty())
             std::printf(", %zu species", map.species.size());
-        std::printf(")\n");
+        std::printf("): %.1f MiB data, ~%.1f MiB/rank at %d ranks\n",
+            double(dataBytes) / (1024.0 * 1024.0),
+            double(dataBytes) / (1024.0 * 1024.0 * double(cs.size)),
+            cs.size);
         for (auto const & note : map.skipped)
             std::printf("  note: %s\n", note.c_str());
     }
@@ -529,6 +569,11 @@ convertFile(Series & series, SdfFile & file, std::string const & path,
     it.close();
     timings.total += now() - t0;
     ++timings.files;
+    {
+        double const rss = peakRssMiB();
+        if (rss > timings.peakRssMiB)
+            timings.peakRssMiB = rss;
+    }
 }
 
 } // namespace sdf2opmd

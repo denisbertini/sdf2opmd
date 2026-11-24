@@ -111,7 +111,7 @@ main(int argc, char * * argv)
             // file closes here (collective inside SDF_C)
         }
 
-        timings.print(cs.rank);
+        timings.print(MPI_COMM_WORLD);
         if (cs.rank == 0 && !cli.quiet)
             std::printf("done.\n");
     }
