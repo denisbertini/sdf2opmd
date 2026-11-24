@@ -69,6 +69,18 @@ elif [[ -n ${STRIPE:-} ]]; then
 fi
 
 ENGINE_ARGS=()
+# BBSTAGE=1 switches the writer to the bbstage engine (denisbertini/ADIOS2
+# fork): iterations land in node-local staging instantly and background
+# threads drain them to OUT_DIR while the converter reads the next SDF
+# file - it pipelines read and write phases instead of serializing them,
+# and absorbs Lustre stalls. CloseMode=durable keeps the guarantee that
+# everything is on OUT_DIR when the converter exits; "staged" returns
+# earlier and the engine's exit finalizer finishes the drain (verified:
+# both modes byte-exact). Requires ADIOS2 built from the fork (default of
+# build_sdf2opmd_cluster.sh).
+if [[ ${BBSTAGE:-} == 1 || ${BBSTAGE:-} == on ]]; then
+    ENGINE_JSON=${ENGINE_JSON:-'{"adios2":{"engine":{"type":"bbstage","pretend_engine":"bp5","parameters":{"CloseMode":"durable","Aggregate":"on"}}}}'}
+fi
 [[ -n ${ENGINE_JSON:-} ]] && ENGINE_ARGS+=(--engine "$ENGINE_JSON")
 
 time srun -n "$RANKS" "$SDF2OPMD" -p "$SDF_DIR" -g 'normal_*.sdf' \

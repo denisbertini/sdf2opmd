@@ -13,7 +13,12 @@ PREFIX=${PREFIX:-$HOME/sdf2opmd-cluster}
 SRC=$PREFIX/src
 JOBS=${JOBS:-8}
 REPO=${REPO:-https://github.com/denisbertini/sdf2opmd.git}
-ADIOS2_TAG=${ADIOS2_TAG:-v2.10.2}
+# ADIOS2: default = denisbertini fork (master) because it carries the
+# bbstage write engine; upstream has no such engine. Plain BP5 conversion
+# works with either. To use upstream instead:
+#   ADIOS2_REPO=https://github.com/ornladios/ADIOS2 ADIOS2_REF=v2.10.2 ...
+ADIOS2_REPO=${ADIOS2_REPO:-https://github.com/denisbertini/ADIOS2}
+ADIOS2_REF=${ADIOS2_REF:-master}
 OPENPMD_TAG=${OPENPMD_TAG:-v0.17.6}
 
 mkdir -p "$SRC" "$PREFIX/bin"
@@ -23,8 +28,8 @@ if [[ ! -d $SRC/sdf2opmd ]]; then
     git clone --recurse-submodules "$REPO" "$SRC/sdf2opmd"
 fi
 git -C "$SRC/sdf2opmd" pull --recurse-submodules
-[[ -d $SRC/adios2 ]] || git clone --depth 1 -b "$ADIOS2_TAG" \
-    https://github.com/ornladios/ADIOS2 "$SRC/adios2"
+[[ -d $SRC/adios2 ]] || git clone --depth 1 -b "$ADIOS2_REF" \
+    "$ADIOS2_REPO" "$SRC/adios2"
 [[ -d $SRC/openPMD-api ]] || git clone --depth 1 -b "$OPENPMD_TAG" \
     https://github.com/openPMD/openPMD-api "$SRC/openPMD-api"
 

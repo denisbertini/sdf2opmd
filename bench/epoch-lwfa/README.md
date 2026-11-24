@@ -94,10 +94,14 @@ byte in (datatypes are preserved). The shape of that traffic is already
 OST-friendly - big contiguous MPI-IO read extents in, and per iteration only
 a few large aggregated BP5 streams (one `.dat` + one `.md` by default), not
 dozens of small writers - but read and write colliding *on the same OSTs*
-is where throughput collapses. Order of defenses:
+is where throughput collapses. (Terms: the **bbstage engine** of
+`BBSTAGE=1` below is yours - a fork of ADIOS2; LRZ's **bbview/bbstage**
+archival tools are a different thing and stage Lustre->EOS.) Order of
+defenses:
 
 1. **Separate filesystems**: read from `/project`, write `OUT_DIR` under
-   `/work` (distinct Lustre instances on Orion); `bbstage` to EOS later.
+   `/work` (distinct Lustre instances on Orion); LRZ `bbstage`/bbview
+   archives to EOS later.
 2. **Disjoint OSTs on one FS**: `STRIPE=<count> ./convert_job.sh ...`
    (runs `lfs setstripe` on the empty output dir; iterations created under
    it inherit the layout).
@@ -107,9 +111,26 @@ is where throughput collapses. Order of defenses:
    shared filesystem).
 4. **Engine shaping** via `ENGINE_JSON` (forwarded verbatim into ADIOS2
    engine params): `SubFiles`/`NumSubFiles` to split or merge data files,
-   `Collectives`, `ThreadsPerBatch`. Note: BP5 cannot write *directly* to
-   EOS - ADIOS2 has no `DataStorage`/XRootD write path in 2.10/2.12; EOS
-   archiving stays a post-hoc `bbstage`/`xrdcp` step, off the critical path.
+   `Collectives`, `ThreadsPerBatch`. Note: plain BP5 cannot write *directly*
+   to EOS - ADIOS2 has no `DataStorage`/XRootD write path in 2.10/2.12; EOS
+   archiving stays a post-hoc `bbview`/`xrdcp` step, off the critical path.
+5. **The bbstage engine** (`BBSTAGE=1 ./convert_job.sh ...`): writes each
+   iteration to node-local NVMe staging instantly and drains it to
+   `OUT_DIR` from background threads *while the converter reads the next
+   SDF file* - read and write phases pipeline instead of serializing, and
+   Lustre stalls no longer halt the converter. Selected through the
+   openPMD→ADIOS2 engine channel
+   (`type: bbstage, pretend_engine: bp5`), so the output is standard BP5;
+   this also rescues the multi-node NVMe idea: staging is local, the
+   finished series always lands complete on `OUT_DIR`. `CloseMode=durable`
+   (default here) means everything is on `OUT_DIR` when the converter
+   exits; `CloseMode=staged` hands the tail to the engine's exit
+   finalizer. Both modes verified byte-exact against the SDF-side
+   analysis. Requires ADIOS2 from the [bbstage
+   fork](https://github.com/denisbertini/ADIOS2) - the default of
+   `build_sdf2opmd_cluster.sh` (upstream ADIOS2 simply lacks the engine).
+   Drain capacity rule of thumb: the converter demands ~1 shared-FS read +
+   1 write stream per node, well under the `ranks x store-rate` ceiling.
 
 And the baseline mitigation: the converter is **offline** - it never runs
 while EPOCH is dumping, and the rank count is a pressure dial (8 ranks ≈
