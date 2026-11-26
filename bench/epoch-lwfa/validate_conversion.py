@@ -186,19 +186,34 @@ def validate_file(sdf_path, series, cmp):
             futures.append((f"step {step} field {sdf_id}", blk.data,
                             rc.load_chunk([0] * len(ext), ext)))
 
-    # particles: species discovered from SDF, mapped by EPOCH block ids
-    species = {m.group(1) for bid in ids
-               if (m := re.match(r"^x_(.+)$", bid))}
+    # particles: BOTH sides authoritative - anything present in one and
+    # unmappable to the other is a FAIL, never a silent skip
+    sdf_species = {m.group(1) for bid in ids
+                   if (m := re.match(r"^x_(.+)$", bid))}
     pmap = dict(c_items(it.particles))
-    for sp in sorted(species):
+    for sp in sorted(sdf_species | set(pmap)):
         if sp not in pmap:
-            cmp.fails.append(f"step {step}: species '{sp}' absent from "
-                             "openPMD")
+            cmp.fails.append(f"step {step}: species '{sp}' in SDF, absent "
+                             "from openPMD")
+            continue
+        if sp not in sdf_species:
+            cmp.fails.append(f"step {step}: species '{sp}' in openPMD, no "
+                             f"'x_{sp}' block in SDF")
             continue
         e = pmap[sp]
         for (rec_name, comp), suffix in PART_MAP:
             bid = f"{suffix}_{sp}"
-            if bid not in ids or rec_name not in e or comp not in e[rec_name]:
+            in_sdf = bid in ids
+            in_opmd = rec_name in e and comp in e[rec_name]
+            if not in_sdf and not in_opmd:
+                continue          # legitimately not stored (e.g. no id)
+            if in_sdf and not in_opmd:
+                cmp.fails.append(f"step {step}: SDF '{bid}' has no openPMD "
+                                 f"{rec_name}/{comp}")
+                continue
+            if in_opmd and not in_sdf:
+                cmp.fails.append(f"step {step}: openPMD {rec_name}/{comp} "
+                                 f"of '{sp}' has no SDF '{bid}'")
                 continue
             n = int(np.asarray(ids[bid].data).size)
             rc = e[rec_name][comp]
