@@ -29,6 +29,8 @@ mpirun -n "$NRANKS" "$SDF2OPMD" -p "$WORK/sdf" -g 'test_*.sdf' \
 
 cd "$HERE"
 for set in normal test; do
+  "$PY" validate_conversion.py --sdf-dir "$WORK/sdf" \
+      --pattern "${set}_*.sdf" --series "$WORK/$set"
   "$PY" analyze_sdf.py "$WORK/sdf" --pattern "${set}_*.sdf" \
       -o "$WORK/stats_sdf_${set}.json"
   "$PY" analyze_openpmd.py "$WORK/$set" -o "$WORK/stats_opmd_${set}.json"
