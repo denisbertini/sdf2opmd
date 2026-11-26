@@ -35,6 +35,78 @@ except ImportError:
     sys.exit("the 'openpmd_api' module is required: pip install openpmd-api")
 
 SCALAR = opmd.Record_Component.SCALAR
+SDF_NP = {1: "<i4", 2: "<i8", 3: "<f4", 4: "<f8", 6: "|S1", 7: "|i1"}
+
+
+def find_sdfdump(explicit):
+    """Helper binary used to read blocks too large for sdfr (>2 GiB)."""
+    import shutil
+    for cand in (explicit, os.environ.get("SDFDUMP"),
+                 os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "..", "..", "build", "sdfdump"),
+                 shutil.which("sdfdump")):
+        if cand and os.path.exists(cand):
+            return cand
+    return None
+
+
+def sdf_array(blk, bid, sdf_path, dump):
+    """sdfr's view of a block, with a raw-MPI-IO fallback for blocks whose
+    data_length exceeds int32 (sdfr limitation, files with >2 GiB blocks)."""
+    try:
+        return np.asarray(blk.data)
+    except ValueError:
+        if dump is None:
+            raise RuntimeError(
+                f"block '{bid}' exceeds sdfr's 2 GiB limit and no sdfdump "
+                "helper found (build sdf2opmd and pass --sdfdump or set "
+                "SDFDUMP)")
+    import subprocess
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".sdfblk", delete=False) as t:
+        tmp = t.name
+    try:
+        r = subprocess.run([dump, sdf_path, bid, tmp],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"sdfdump failed for '{bid}': {r.stderr}")
+        dtype_id, nbytes = r.stdout.split()
+        dtype_id, nbytes = int(dtype_id), int(nbytes)
+        if dtype_id not in SDF_NP:
+            raise RuntimeError(f"sdfdump: SDF datatype {dtype_id} of "
+                               f"'{bid}' has no numpy mapping")
+        dt = np.dtype(SDF_NP[dtype_id])
+        arr = np.fromfile(tmp, dtype=dt, count=nbytes // dt.itemsize)
+        dims = getattr(blk, "dims", None)
+        if dims is not None and len(dims) > 1 \
+                and int(np.prod([int(d) for d in dims])) == arr.size:
+            arr = arr.reshape([int(d) for d in dims], order="F")
+        return arr
+    finally:
+        os.unlink(tmp)
+
+
+def grid_axes(blk, bid, sdf_path, dump):
+    """Per-axis node arrays of a plain-mesh (grid) block. sdfr keeps these in
+    separate buffers (contents.grids[i]), so its view is a tuple of arrays;
+    the raw fallback reads the concatenated block and splits by dims."""
+    try:
+        data = blk.data
+        if isinstance(data, (tuple, list)):
+            return [np.asarray(a) for a in data]
+        return [np.asarray(data)]
+    except ValueError:
+        if dump is None:
+            raise RuntimeError(
+                f"grid '{bid}' exceeds sdfr's 2 GiB limit and no sdfdump "
+                "helper found (build sdf2opmd and pass --sdfdump)")
+        raw = sdf_array(blk, bid, sdf_path, dump).ravel()
+        out, off = [], 0
+        for d in blk.dims:
+            d = int(d)
+            out.append(raw[off:off + d])
+            off += d
+        return out
 
 
 def access_read_only():
@@ -87,6 +159,11 @@ class Cmp:
         self.verbose = verbose
         self.n_ok = 0
         self.fails = []
+        self.skips = []
+
+    def skip(self, name, why):
+        """Unchecked data is announced, never silently passed."""
+        self.skips.append(f"{name}: {why}")
 
     def eq(self, name, a, b):
         a, b = np.asarray(a), np.asarray(b)
@@ -114,7 +191,7 @@ class Cmp:
             print(f"    ok {name} {a.shape} {a.dtype}")
 
 
-def validate_file(sdf_path, series, cmp):
+def validate_file(sdf_path, series, cmp, dump=None):
     tag = os.path.basename(sdf_path)
     f = sdfr.read(sdf_path, derived=False)
     ids = f.id_dict
@@ -134,29 +211,17 @@ def validate_file(sdf_path, series, cmp):
              float(np.asarray(ids["dt"].data).ravel()[0]),
              float(it.dt) if it.contains_attribute("dt") else 1.0)
 
-    # grid axes: sdfr node arrays vs the sdf_axis_* audit attributes
-    grid = ids.get("general_grid")
-    if grid is not None:
-        mesh = next((m for _, m in c_items(it.meshes)
-                     if any(m.contains_attribute(f"sdf_axis_{lbl}")
-                            for lbl in m.axis_labels)), None)
-        if mesh is None:
-            cmp.fails.append(f"step {step}: no mesh carries sdf_axis_*")
-        else:
-            for lbl, axis in zip(mesh.axis_labels, grid.data):
-                key = f"sdf_axis_{lbl}"
-                if not mesh.contains_attribute(key):
-                    cmp.fails.append(f"step {step}: mesh lacks {key}")
-                    continue
-                cmp.eq(f"step {step} grid axis {lbl}", axis,
-                       mesh.get_attribute(key))
-
-    # fields: discovered via the converter's own sdf_id stamps
+    # fields: discovered via the converter's own sdf_id stamps; mapping them
+    # also tells us which SDF grid each openPMD mesh was built from
     futures = []
-    for _, rec in c_items(it.meshes):
+    claimed = set()
+    mesh_grid = {}                      # mesh name -> SDF grid block id
+    for mname, rec in c_items(it.meshes):
         ndim = len(rec.grid_global_offset)
         for _, rc in c_items(rec):
             if not rc.contains_attribute("sdf_id"):
+                cmp.fails.append(f"step {step}: component '{mname}' lacks "
+                                 "sdf_id (reconvert with current converter?)")
                 continue
             sdf_id = str(rc.get_attribute("sdf_id"))
             blk = ids.get(sdf_id)
@@ -164,6 +229,14 @@ def validate_file(sdf_path, series, cmp):
                 cmp.fails.append(f"step {step}: openPMD claims sdf_id "
                                  f"'{sdf_id}', absent from SDF file")
                 continue
+            claimed.add(sdf_id)
+            gid = getattr(blk, "grid_id", None)
+            if gid:
+                prev = mesh_grid.get(mname)
+                if prev is not None and prev != gid:
+                    cmp.fails.append(f"step {step}: mesh '{mname}' mixes SDF "
+                                     f"grids '{prev}' and '{gid}'")
+                mesh_grid[mname] = gid
             if rec.contains_attribute("position") and \
                     rc.contains_attribute("sdf_stagger"):
                 st = int(rc.get_attribute("sdf_stagger"))
@@ -175,13 +248,64 @@ def validate_file(sdf_path, series, cmp):
                 else:
                     cmp.n_ok += 1
             ext = list(rc.shape)
-            futures.append((f"step {step} field {sdf_id}", blk.data,
+            futures.append((f"step {step} field {sdf_id}",
+                            sdf_array(blk, sdf_id, sdf_path, dump),
                             rc.load_chunk([0] * len(ext), ext)))
+
+    def is_plain_mesh(b):
+        raw = getattr(b, "_contents", None)
+        return raw is not None and int(raw.blocktype) == 1
+
+    def blocktype(b):
+        raw = getattr(b, "_contents", None)
+        return None if raw is None else int(raw.blocktype)
+
+    # SDF-side completeness: every grid field must have been converted
+    for bid, blk in sorted(ids.items()):
+        if blocktype(blk) == 3 and bid not in claimed:   # PLAIN_VARIABLE
+            cmp.fails.append(f"step {step}: SDF field '{bid}' was not "
+                             "converted")
+
+    # grid axes: the SDF node arrays vs the sdf_axis_* audit attributes of
+    # the mesh the converter built on that same grid
+    grids = {bid for bid, blk in ids.items() if is_plain_mesh(blk)}
+    for mname, rec in c_items(it.meshes):
+        gid = mesh_grid.get(mname)
+        if gid is None and len(grids) == 1:
+            gid = next(iter(grids))
+        elif gid is None and rec.contains_attribute("sdf_mesh_id"):
+            gid = str(rec.get_attribute("sdf_mesh_id"))
+        if gid is None:
+            cmp.skip(f"step {step} mesh '{mname}' axes",
+                     "cannot tell which SDF grid it came from")
+            continue
+        if gid not in grids:
+            cmp.fails.append(f"step {step}: mesh '{mname}' grid '{gid}' is "
+                             "not a plain-mesh block in the SDF file")
+            continue
+        have = [lbl for lbl in rec.axis_labels
+                if rec.contains_attribute(f"sdf_axis_{lbl}")]
+        if not have:
+            cmp.skip(f"step {step} mesh '{mname}' axes",
+                     "no sdf_axis_* stamps (grid too large or older "
+                     "converter)")
+            continue
+        axes = grid_axes(ids[gid], gid, sdf_path, dump)
+        for lbl, axis in zip(rec.axis_labels, axes):
+            if lbl not in have:
+                cmp.fails.append(f"step {step}: mesh '{mname}' lacks "
+                                 f"sdf_axis_{lbl}")
+                continue
+            cmp.eq(f"step {step} grid '{gid}' axis {lbl}", axis,
+                   rec.get_attribute(f"sdf_axis_{lbl}"))
+    for bid in sorted(grids - set(mesh_grid.values())):
+        cmp.skip(f"step {step} grid '{bid}' axes",
+                 "no converted field lives on it")
 
     # particles: driven by the converter's own sdf_id stamps on datasets
     # (immune to EPOCH's truncated species names and subset duplications),
     # plus a completeness check from the SDF side
-    claimed = set()
+    claimed_parts = set()
     for sp, e in sorted(c_items(it.particles)):
         for rec_name, rec in c_items(e):
             for comp, rc in c_items(rec):
@@ -198,12 +322,14 @@ def validate_file(sdf_path, series, cmp):
                                      f"'{sp}/{rec_name}/{comp}' claims "
                                      f"sdf_id '{bid}', absent from SDF")
                     continue
-                claimed.add(bid)
+                claimed_parts.add(bid)
                 n = int(list(rc.shape)[0])
                 futures.append((f"step {step} particle {sp}/{bid}",
-                                blk.data, rc.load_chunk([0], [n])))
+                                sdf_array(blk, bid, sdf_path, dump),
+                                rc.load_chunk([0], [n])))
     for bid in sorted(ids):
-        if re.match(r"^(x|y|z|px|py|pz|w|id)_.+$", bid) and bid not in claimed:
+        if re.match(r"^(x|y|z|px|py|pz|w|id)_.+$", bid) \
+                and bid not in claimed_parts:
             cmp.fails.append(f"step {step}: SDF particle block '{bid}' was "
                              "not converted")
 
@@ -221,6 +347,10 @@ def main():
                     help="openPMD series dir or %%T pattern")
     ap.add_argument("--rtol", type=float, default=0.0,
                     help="0 (default) = exact incl. dtype; >0 relaxes")
+    ap.add_argument("--sdfdump",
+                    help="path to the sdf2opmd 'sdfdump' helper, used to "
+                         "read blocks over sdfr's 2 GiB limit "
+                         "(also $SDFDUMP)")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -235,12 +365,16 @@ def main():
 
     series = open_series(args.series)
     cmp = Cmp(args.rtol, args.verbose)
+    dump = find_sdfdump(args.sdfdump)
     for fpath in files:
         print(f"validating {fpath}")
-        validate_file(fpath, series, cmp)
+        validate_file(fpath, series, cmp, dump)
 
     print(f"\n{cmp.n_ok} comparisons passed, "
-          f"{len(cmp.fails)} failed (rtol {cmp.rtol:g})")
+          f"{len(cmp.fails)} failed, {len(cmp.skips)} skipped "
+          f"(rtol {cmp.rtol:g})")
+    for d in cmp.skips[:20]:
+        print(f"  SKIP {d}")
     for d in cmp.fails[:50]:
         print(f"  FAIL {d}")
     if len(cmp.fails) > 50:

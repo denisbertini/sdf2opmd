@@ -38,6 +38,33 @@ sbatch --export=ALL,OUT_DIR=/lustre/.../out ./convert_job.sh ./data /lustre/.../
 
 # 3. validation: same analysis on SDF vs openPMD, must match
 sbatch ./run_analysis.sh ./data /lustre/.../out
+
+# 3b. and/or the element-wise gate (bit-exact, no field lists to maintain):
+python3 validate_conversion.py --sdf-dir ./data --pattern 'normal_*.sdf' \
+    --series /lustre/.../out/simData
+```
+
+## validate_conversion.py — element-wise gate
+
+One command, exit code 0/1, no hand-maintained field/species lists: it reads
+the mapping from the converter's own audit stamps (`sdf_id` on every record
+component, `sdf_axis_*`/`sdf_mesh_id` on meshes) and then compares, per file,
+`time`/`dt`, the grid node axes, the stagger -> `position` invariant, every
+field and every particle variable, element by element. The conversion is
+lossless, so the default is **exact equality including dtype**; `--rtol`
+loosens only for deliberate dtype experiments. Anything the script cannot
+check is reported as `SKIP <what>: <why>` in the summary, never passed
+silently.
+
+Blocks larger than 2 GiB (EPOCH dumps with >250M particles per species)
+overflow a 32-bit length inside the pure-python `sdfr` reader, which is a
+reader limitation, not a conversion problem. For those files point the
+validator at the `sdfdump` helper of this repo (same SDF_C + MPI-IO path as
+the converter):
+
+```sh
+cmake --build build --target sdfdump
+export SDFDUMP=$PWD/build/sdfdump        # or --sdfdump path/to/sdfdump
 ```
 
 Each step's log records the numbers to graph: per-step conversion
