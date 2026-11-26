@@ -35,14 +35,6 @@ except ImportError:
     sys.exit("the 'openpmd_api' module is required: pip install openpmd-api")
 
 SCALAR = opmd.Record_Component.SCALAR
-# openPMD (record, component) -> SDF block-id suffix per species
-PART_MAP = [
-    (("position", "x"), "x"), (("position", "y"), "y"),
-    (("position", "z"), "z"),
-    (("momentum", "x"), "px"), (("momentum", "y"), "py"),
-    (("momentum", "z"), "pz"),
-    (("weighting", SCALAR), "w"), (("id", SCALAR), "id"),
-]
 
 
 def access_read_only():
@@ -186,39 +178,34 @@ def validate_file(sdf_path, series, cmp):
             futures.append((f"step {step} field {sdf_id}", blk.data,
                             rc.load_chunk([0] * len(ext), ext)))
 
-    # particles: BOTH sides authoritative - anything present in one and
-    # unmappable to the other is a FAIL, never a silent skip
-    sdf_species = {m.group(1) for bid in ids
-                   if (m := re.match(r"^x_(.+)$", bid))}
-    pmap = dict(c_items(it.particles))
-    for sp in sorted(sdf_species | set(pmap)):
-        if sp not in pmap:
-            cmp.fails.append(f"step {step}: species '{sp}' in SDF, absent "
-                             "from openPMD")
-            continue
-        if sp not in sdf_species:
-            cmp.fails.append(f"step {step}: species '{sp}' in openPMD, no "
-                             f"'x_{sp}' block in SDF")
-            continue
-        e = pmap[sp]
-        for (rec_name, comp), suffix in PART_MAP:
-            bid = f"{suffix}_{sp}"
-            in_sdf = bid in ids
-            in_opmd = rec_name in e and comp in e[rec_name]
-            if not in_sdf and not in_opmd:
-                continue          # legitimately not stored (e.g. no id)
-            if in_sdf and not in_opmd:
-                cmp.fails.append(f"step {step}: SDF '{bid}' has no openPMD "
-                                 f"{rec_name}/{comp}")
-                continue
-            if in_opmd and not in_sdf:
-                cmp.fails.append(f"step {step}: openPMD {rec_name}/{comp} "
-                                 f"of '{sp}' has no SDF '{bid}'")
-                continue
-            n = int(np.asarray(ids[bid].data).size)
-            rc = e[rec_name][comp]
-            futures.append((f"step {step} particle {bid}", ids[bid].data,
-                            rc.load_chunk([0], [n])))
+    # particles: driven by the converter's own sdf_id stamps on datasets
+    # (immune to EPOCH's truncated species names and subset duplications),
+    # plus a completeness check from the SDF side
+    claimed = set()
+    for sp, e in sorted(c_items(it.particles)):
+        for rec_name, rec in c_items(e):
+            for comp, rc in c_items(rec):
+                if not rc.contains_attribute("sdf_id"):
+                    cmp.fails.append(f"step {step}: particle dataset "
+                                     f"'{sp}/{rec_name}/{comp}' lacks "
+                                     "sdf_id (reconvert with current "
+                                     "converter?)")
+                    continue
+                bid = str(rc.get_attribute("sdf_id"))
+                blk = ids.get(bid)
+                if blk is None:
+                    cmp.fails.append(f"step {step}: openPMD particle "
+                                     f"'{sp}/{rec_name}/{comp}' claims "
+                                     f"sdf_id '{bid}', absent from SDF")
+                    continue
+                claimed.add(bid)
+                n = int(list(rc.shape)[0])
+                futures.append((f"step {step} particle {sp}/{bid}",
+                                blk.data, rc.load_chunk([0], [n])))
+    for bid in sorted(ids):
+        if re.match(r"^(x|y|z|px|py|pz|w|id)_.+$", bid) and bid not in claimed:
+            cmp.fails.append(f"step {step}: SDF particle block '{bid}' was "
+                             "not converted")
 
     series.flush()
     for name, sdf_arr, fut in futures:
