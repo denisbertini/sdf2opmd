@@ -26,8 +26,10 @@
 # ---- where to write (Lustre read+write contention) ------------------------
 # Conversion reads SDF and writes BP5 at ~the same time; keep those two
 # streams off the same OSTs:
-#   * best:      dumps under /project, OUT_DIR under /work - separate Lustre
-#                instances, zero contention by construction; bbstage later
+#   * best:      read the dumps from one filesystem and write OUT_DIR to
+#                another (check `df -hT` and $SCRATCH on your system - LRZ
+#                sites differ: SuperMUC has $WORK/$SCRATCH, other systems
+#                only Lustre + node-local $TMPDIR) -> no contention at all
 #   * same FS:   STRIPE=<n> pins OUT_DIR to a (fresh) OST stripe set so
 #                reads and writes never share targets (Lustre inheritance:
 #                set it while OUT_DIR is empty)

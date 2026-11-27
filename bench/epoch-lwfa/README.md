@@ -156,14 +156,24 @@ is where throughput collapses. (Terms: the **bbstage engine** of
 archival tools are a different thing and stage Lustre->EOS.) Order of
 defenses:
 
-1. **Separate filesystems**: read from `/project`, write `OUT_DIR` under
-   `/work` (distinct Lustre instances on Orion); LRZ `bbstage`/bbview
-   archives to EOS later.
+1. **Separate filesystems**: read the SDF dumps from one filesystem and write
+   `OUT_DIR` to another. Do not assume a path - discover it on the machine
+   you are on:
+
+   ```sh
+   df -hT | grep -vE "tmpfs|overlay|squashfs|devtmpfs"
+   echo "SCRATCH=$SCRATCH TMPDIR=$TMPDIR SLURM_TMPDIR=$SLURM_TMPDIR"
+   lfs getstripe /lustre/$USER 2>/dev/null | head -3   # if Lustre
+   ```
+
+   Node-local directories (`/tmp`, `$TMPDIR` on some sites, `$SLURM_TMPDIR`)
+   are invisible to other nodes and deleted when the job ends: validate inside
+   the same job, then move the series wherever it must live.
 2. **Disjoint OSTs on one FS**: `STRIPE=<count> ./convert_job.sh ...`
    (runs `lfs setstripe` on the empty output dir; iterations created under
    it inherit the layout).
 3. **Single-node NVMe fast lane** for series that fit: `NODES=1`,
-   `OUT_DIR=/ssd/$USER/$SLURM_JOB_ID/out`, then one `xrdcp`/rsync to EOS.
+   `OUT_DIR=$TMPDIR/out`, then one `xrdcp`/rsync wherever it belongs.
    Multi-node NVMe output is invalid (one `.md` per iteration needs a
    shared filesystem).
 4. **Engine shaping** via `ENGINE_JSON` (forwarded verbatim into ADIOS2

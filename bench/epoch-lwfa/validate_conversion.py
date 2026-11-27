@@ -162,9 +162,9 @@ def open_series(path):
     """Series dir -> rebuild the file-based %T pattern automatically."""
     if not os.path.exists(path):
         sys.exit(f"no openPMD path {path!r}\n"
-                 "  a series written under a node's local /tmp exists only on\n"
-                 "  that node: run the validator there, or write the series to\n"
-                 "  /work or Lustre so every node sees it")
+                 "  a series written under a node's local /tmp or $TMPDIR\n"
+                 "  exists only on that node: run the validator there (or in\n"
+                 "  the same job), or write the series to a shared filesystem")
     if os.path.isdir(path):
         entries = sorted(os.listdir(path))
         cands = [f for f in entries if f.endswith(".bp")]
