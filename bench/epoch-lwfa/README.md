@@ -15,6 +15,7 @@ converted data (`openpmd_api`) - and comparing the results.
 | `epoch_job.sh` | sbatch wrapper (step 1), reproduces your Orion submit pattern |
 | `run_epoch.sh` | the run-file: `apptainer exec $CONT epoch3d` |
 | `convert_job.sh` | step 2: parallel `sdf2opmd` conversion + timings |
+| `convert_validate_job.sh` | **convert on N nodes and validate in the same job** (shards files across nodes, fails the job on any mismatch) |
 | `run_analysis.sh` | step 3: both analyses + strict comparison (sbatchable) |
 | `analyze_sdf.py` | analysis straight on SDF via the EPOCH `sdfr` reader |
 | `analyze_openpmd.py` | identical analysis on the converted openPMD series |
@@ -42,6 +43,60 @@ sbatch ./run_analysis.sh ./data /lustre/.../out
 # 3b. and/or the element-wise gate (bit-exact, no field lists to maintain):
 python3 validate_conversion.py --sdf-dir ./data --pattern 'normal_*.sdf' \
     --series /lustre/.../out/simData
+
+# 2+3 in one job, on as many nodes as you like (recommended):
+sbatch --nodes=4 \
+    --export=ALL,CONT=$CONT,SDF_DIR=$PWD/data,SDF2OPMD=$PWD/../build/sdf2opmd,\
+OUT_DIR=/lustre/.../out,PATTERN='normal_*.sdf' \
+    ./convert_validate_job.sh
+```
+
+## convert_validate_job.sh — multi-node conversion + in-job gate
+
+Converting on more than one node and validating afterwards is one submission,
+not two, so a bad conversion fails the job rather than leaving a series behind
+for someone to trust later:
+
+```sh
+sbatch --nodes=4 --export=ALL,\
+CONT=/lustre/.../pp.sif,\
+SDF_DIR=/lustre/.../lwfa/data,\
+SDF2OPMD=/lustre/.../sdf2opmd/build/sdf2opmd,\
+SDFDUMP=/lustre/.../sdf2opmd/build/sdfdump,\
+OUT_DIR=/lustre/.../out,PATTERN='0*.sdf',STRIPE=8 \
+    bench/epoch-lwfa/convert_validate_job.sh
+```
+
+How it parallelizes, and why:
+
+- **No MPI world across nodes.** Launching one MPI job inside a container under
+  Slurm needs the image's MPI to speak the scheduler's launch protocol. Instead
+  each node runs a fully local `mpirun -np $PPT` over `1/NODES` of the input
+  files. This works with any MPI that already works on one node.
+- **The shards assemble one series.** openPMD file-based output makes each
+  iteration a self-contained `.bp`, so independent writers add iterations to the
+  same directory and the validator opens the union as one series (proven by
+  `--local` rehearsal: two shards, one 3-iteration series, bit-exact).
+- **Trade-off:** granularity is one file. A single 17 GB dump therefore only
+  scales to one node's ranks; a 100-file dump set scales perfectly. To beat
+  that for one fat file you need a real multi-node MPI world - see below.
+- Guards: refuses a node-local `OUT_DIR` for multi-node runs, prints the
+  filesystem it resolved, checks *iterations written == input files*, and
+  `VALIDATE=0` is the only way to skip the comparison.
+- Rehearse the whole flow without Slurm or a container:
+
+  ```sh
+  CONT= NODES=2 PPT=2 SDF_DIR=/tmp/fx OUT_DIR=$HOME/shard-test \
+  PYTHON=.../bin/python bench/epoch-lwfa/convert_validate_job.sh --local
+  ```
+
+To use a genuine cross-node MPI world instead (one `mpirun` spanning nodes),
+first check what the image can do:
+
+```sh
+apptainer exec $CONT sh -c 'ompi_info | grep -iE "pmix|slurm|pbs"'
+# pmix support + host PMIx matching -> srun --mpi=pmix ... works;
+# otherwise keep sharding, or add srun-launched OMPI (--mca plm slurm) at build time
 ```
 
 ## validate_conversion.py — element-wise gate
