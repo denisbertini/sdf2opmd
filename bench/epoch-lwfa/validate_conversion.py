@@ -157,10 +157,17 @@ def access_read_only():
 
 def open_series(path):
     """Series dir -> rebuild the file-based %T pattern automatically."""
+    if not os.path.exists(path):
+        sys.exit(f"no openPMD path {path!r}\n"
+                 "  a series written under a node's local /tmp exists only on\n"
+                 "  that node: run the validator there, or write the series to\n"
+                 "  /work or Lustre so every node sees it")
     if os.path.isdir(path):
-        cands = sorted(f for f in os.listdir(path) if f.endswith(".bp"))
+        entries = sorted(os.listdir(path))
+        cands = [f for f in entries if f.endswith(".bp")]
         if not cands:
-            sys.exit(f"no .bp found under {path}")
+            sys.exit(f"no .bp under {path!r} (found: "
+                     f"{', '.join(entries[:8]) or 'nothing'})")
         first = cands[0]
         if "%T" not in first:
             m = re.search(r"(\d+)", first)
