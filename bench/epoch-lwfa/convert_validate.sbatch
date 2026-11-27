@@ -41,14 +41,14 @@
 set -uo pipefail
 
 export CONT=${CONT-/lustre/rz/dbertini2/mpiio_evolve/container/plasma_pp.sif}
-export APPTAINER_BINDPATH=${APPTAINER_BINDPATH-/lustre/rz/dbertini2}
+export APPTAINER_BINDPATH=${APPTAINER_BINDPATH-/lustre/rz}   # repo + data + image
 export APPTAINER_SHARENS=true
 export APPTAINER_CONFIGDIR=/tmp/$USER
 export OMPI_MCA_io=romio341              # same ROMIO choice as the PIO bench
 export TMPDIR=${SLURM_TMPDIR:-/tmp}      # >2 GiB block dumps go to node NVMe
 
 # ---- edit these (or --export=ALL,S=...,DATA=...) ----------------------------
-R=${R:-/lustre/rz/dbertini2/io-tests/sdf}   # benchmark root
+R=${R:-/lustre/rz/dbertini/io-tests/sdf}    # benchmark root
 S=${S:-$R/sdf2opmd}                         # repo clone (with build/)
 DATA=${DATA:-$R/lwfa/data}                  # SDF dumps - read side
 OUT=${OUT:-$R/opmd}                         # openPMD series - write side
