@@ -149,19 +149,52 @@ if [[ $DRY != 1 ]] && command -v lfs >/dev/null 2>&1; then
     fi
 fi
 
-# ---- optional cross-node MPI probe -----------------------------------------
-if [[ $PROBE == 1 && $DRY != 1 && $LEGS[0] == world:* ]]; then
-    echo "probing MPI world: ${ALL[0]##*/} --info on $NT rank(s) / $NODES node(s)"
+# ---- containers: verify + warm ONCE PER NODE before the world starts -------
+# Orion's rootless apptainer mounts the image per instance (squashfuse_ll).
+# Launching 32 cold instances per node simultaneously - which is exactly what
+# a per-rank `apptainer exec` step does - is a measured stall point: instances
+# fail with dbus/squashfuse timeouts and the MPI world dies behind them
+# (scripts/mpi_probe_diag.sbatch reproduces both failure and fix; after one
+# warm-up launch per node, the identical 128-rank world comes up in ~7 s).
+# One instance per node first: names the broken node in seconds, warms the
+# node's image cache for every rank that follows. NEVER add `--bind /dev/shm`
+# to make the container "see" sm memory: it pushes rootless apptainer into a
+# cgroups/dbus path that fails outright on Orion. The plain config works.
+cluster_leg=0
+for spec in "${LEGS[@]}"; do [[ $spec != local:* ]] && cluster_leg=1; done
+wrap=(); [[ -n ${CONT:-} ]] && wrap=(apptainer exec "$CONT")
+if [[ $DRY != 1 && $cluster_leg == 1 && -n ${CONT:-} ]]; then
+    echo "warming $CONT once per node"
+    t0=$(date +%s)
+    srun --ntasks="$NODES" --ntasks-per-node=1 --label \
+        timeout "${CONT_T:-300}" "${wrap[@]}" true \
+        || { echo "ABORT: container did not start on every node" >&2; exit 1; }
+    echo "container ok on $NODES node(s) in $(( $(date +%s) - t0 ))s"
+fi
+
+# ---- can the MPI world bootstrap? (hard timeout: a stall dies as rc=124 in
+# ---- PROBE_T seconds, never as a job someone has to scancel) ---------------
+need_probe=0
+for spec in "${LEGS[@]}"; do [[ $spec == world:* ]] && need_probe=1; done
+if [[ $PROBE == 1 && $DRY != 1 && $need_probe == 1 ]]; then
+    echo "probing MPI world: ${ALL[0]##*/} --info on $NT rank(s) / $NODES node(s), timeout ${PROBE_T:-180}s"
+    t0=$(date +%s)
     "${SRUN[@]}" --ntasks="$NT" --ntasks-per-node="$PPT" --label \
-        apptainer exec "$CONT" bash -c "'$BIN' --info -p '$DATA' -f '${ALL[0]}' >/dev/null" \
+        bash -c "log=/tmp/sdfprobe.\$SLURM_JOB_ID.\$SLURM_PROCID
+                 timeout ${PROBE_T:-180} ${wrap[*]:-} '$BIN' --info -p '$DATA' -f '${ALL[0]}' >/dev/null 2>\$log
+                 rc=\$?; (( rc > 1 )) && { echo \"rank \$SLURM_PROCID on \$(hostname) rc=\$rc:\" >&2; tail -5 \$log >&2; }
+                 echo \"probe rank \$SLURM_PROCID ok\"; rm -f \$log" \
         || { cat >&2 <<'EOF'
 ABORT: the MPI world did not come up under srun.
+  rc=124 = the probe hit its timeout (bootstrap stall); the rank logs above
+           say who got stuck. The usual cause is container-launch contention:
+           raise CONT_T/PROBE_T or check that the warm-up above passed.
   - other plugins:      --export=ALL,MPI_TAG=pmi2   (or pmix_v3, or '')
   - what the image has: apptainer exec $CONT ompi_info | grep -iE 'pmix|pmi|slurm'
   - or drop the world legs:  --export=ALL,LEGS="shard:default shard:stripe"
 EOF
               exit 1; }
-    echo "probe ok"
+    echo "probe ok in $(( $(date +%s) - t0 ))s: MPI world spans $NODES node(s)"
 fi
 
 # ---- one leg ---------------------------------------------------------------
@@ -185,8 +218,11 @@ run_leg() {
     local t0=$(date +%s%N) rc=0
     case $launch in
     world)
+        # CONVT=<seconds> puts a hard ceiling on the measured window: an MPI
+        # stall then ends the leg with rc=124 instead of eating the wall limit
+        local -a to=(); [[ -n ${CONVT:-} ]] && to=(timeout "$CONVT")
         sayrun "${SRUN[@]}" --ntasks="$NT" --ntasks-per-node="$PPT" --label \
-            "${wrap[@]}" "$BIN" "${conv[@]}" --files "$list" || rc=1 ;;
+            "${to[@]}" "${wrap[@]}" "$BIN" "${conv[@]}" --files "$list" || rc=1 ;;
     shard)
         sayrun "${SRUN[@]}" --ntasks="$NODES" --ntasks-per-node=1 --label \
             env A="$A" DATA="$DATA" OUT="$out" LIST="$list" PPT="$PPT" \
