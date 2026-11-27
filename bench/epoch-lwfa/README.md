@@ -15,7 +15,7 @@ converted data (`openpmd_api`) - and comparing the results.
 | `epoch_job.sh` | sbatch wrapper (step 1), reproduces your Orion submit pattern |
 | `run_epoch.sh` | the run-file: `apptainer exec $CONT epoch3d` |
 | `convert_job.sh` | step 2: parallel `sdf2opmd` conversion + timings |
-| `convert_validate.sbatch` | **convert on N nodes with `srun`, validate in the same job** (world/shard/local launch modes, fails the job on any mismatch) |
+| `../../scripts/submit_convert.sh` | **the srun conversion matrix**: several launch/layout legs in one sbatch job, each validated in-job (fails on any mismatch) |
 | `run_analysis.sh` | step 3: both analyses + strict comparison (sbatchable) |
 | `analyze_sdf.py` | analysis straight on SDF via the EPOCH `sdfr` reader |
 | `analyze_openpmd.py` | identical analysis on the converted openPMD series |
@@ -45,56 +45,68 @@ python3 validate_conversion.py --sdf-dir ./data --pattern 'normal_*.sdf' \
     --series /lustre/.../out/simData
 
 # 2+3 in one job, on as many nodes as you like (recommended):
-sbatch --nodes=4 --export=ALL,DATA=$PWD/data,OUT=/lustre/.../out,\
-PATTERN='normal_*.sdf' ./convert_validate.sbatch
+sbatch --nodes=4 --export=ALL,DATA=$PWD/data,PAT='normal_*.sdf' \
+    ../../scripts/submit_convert.sh
 ```
 
-## convert_validate.sbatch — multi-node conversion with `srun` + in-job gate
+## scripts/submit_convert.sh — srun conversion matrix + in-job gate
 
-One submission converts on N nodes and validates inside the same job, so a bad
-conversion fails the job instead of leaving a series behind for someone to
-trust later:
+One submission runs a whole matrix of conversion *legs* back to back, so every
+number is a within-session comparison, and each leg is validated bit-exact
+against its own SDF slice inside the same job — a bad conversion fails the job
+instead of leaving a series behind for someone to trust later:
 
 ```sh
 sbatch --nodes=4 --export=ALL,\
 DATA=/lustre/.../lwfa/data,\
-OUT=/lustre/.../opmd,\
+ROOT=/lustre/.../conv-bench,\
 PAT='0*.sdf',STRIPE=16 \
-    bench/epoch-lwfa/convert_validate.sbatch
+    scripts/submit_convert.sh
 ```
 
-Three launch modes:
+Legs are `launch:placement` pairs (`LEGS=`). The default matrix is
+`world:default shard:default world:stripe`, which isolates the two variables
+that matter: legs 1/2 compare the **launch mechanism**, legs 1/3 the **output
+layout**.
 
-| `LAUNCH=` | what runs | when |
+| `launch` | what runs | when |
 |---|---|---|
-| `world` (default) | `srun --mpi=pmix ... apptainer exec $CONT sdf2opmd`, one task per rank — the whole MPI world spans the allocation, bootstrapped through the PMI/PMIx Slurm hands down (the fd survives the container boundary) | the only mode that spreads **one fat dump** over several nodes |
-| `shard` | `srun --ntasks=$NODES --ntasks-per-node=1 ...`, each task running a purely local `mpirun -np $PPT` over `1/NODES` of the files | no PMI/PMIx dependency at all; granularity is one file |
-| `local` | shards as background processes, no Slurm/container | rehearsing the whole flow on a workstation |
+| `world` | `srun --mpi=pmix ... apptainer exec $CONT sdf2opmd`, one task per rank — the whole MPI world spans the allocation, bootstrapped through the PMI/PMIx Slurm hands down (the fd survives the container boundary) | the only mode that spreads **one fat dump** over several nodes |
+| `shard` | `srun --ntasks=$NODES --ntasks-per-node=1 ...`, each task running a purely local `mpirun -np $PPT` over its file subset | no PMI/PMIx dependency at all; granularity is one file |
+| `local` | direct run, no Slurm/container | workstation rehearsal |
 
 Both cluster modes produce the **same series**: openPMD file-based output makes
 each iteration a self-contained `.bp`, so independent writers add iterations to
 one directory and the validator opens the union as a single series (proved by
-the `local` rehearsal: two shards → one 3-iteration series, bit-exact).
+the `local` rehearsal: shards → one series, bit-exact).
 
 Built-in discipline, because a benchmark that measures the wrong thing is worse
 than none:
 
-- `MPI_PROBE=1` (default) runs `--info` across the full rank count *first*: if
-  the image's MPI cannot bootstrap under `srun`, it aborts in seconds and prints
-  the fallbacks (`MPI_TAG=pmi2`, `MPI_TAG=`, or `LAUNCH=shard`) instead of
-  failing 40 minutes into the conversion.
-- Stripe layout is *probed* by creating a file inside `OUT` and reading its
-  stripe count back; a mismatch aborts, since MDT defaults drift cluster-wide.
-- `iterations written == input files` is asserted, `du -sb` and per-rank
-  throughput are printed, and validation runs **after** the measured window so
-  it never inflates the numbers.
+- `COLD=rotate` (default) gives every leg its own equal-size slice of the input
+  files, so no leg runs on page cache left behind by another leg; with
+  `COLD=same` all legs read the same inputs (warm after the first — then
+  compare mechanism only, never bandwidth). Validation is scoped to exactly
+  the files the leg converted.
+- `PROBE=1` (default) runs `--info` across the full rank count *before* a
+  `world` leg: if the image's MPI cannot bootstrap under `srun`, it aborts in
+  seconds and prints the fallbacks (`MPI_TAG=pmi2`, `MPI_TAG=`, or drop the
+  world legs) instead of failing 40 minutes into the conversion.
+- Stripe layout is *probed* per leg directory (create a probe file, read its
+  stripe count back): the `:stripe` leg must show `$STRIPE`, and the job aborts
+  if the MDT `:default` already equals `$STRIPE` — then the two placement legs
+  would silently measure the same layout (`LAYOUT_STRICT=0` to override).
+- `iterations written == inputs` is asserted per leg, `du -sb` and per-rank
+  throughput are printed in one `RESULT leg=...` line each, and validation runs
+  **after** the measured window so it never inflates the numbers.
 - `DRY=1` prints the exact `srun` command lines without launching anything.
 
 Rehearse locally (no Slurm, no container):
 
 ```sh
-CONT= LAUNCH=local NODES=2 PPT=2 S=$PWD DATA=/tmp/fx OUT=$HOME/shard-test \
-PYTHON=/path/to/venv/bin/python bench/epoch-lwfa/convert_validate.sbatch
+CONT= A=$PWD DATA=/tmp/fx ROOT=$HOME/conv-bench \
+LEGS="local:default local:stripe" \
+PYTHON=/path/to/venv/bin/python scripts/submit_convert.sh
 ```
 
 To see what a real cross-node world would need from the image:
