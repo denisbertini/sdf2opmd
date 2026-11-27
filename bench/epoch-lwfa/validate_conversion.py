@@ -8,7 +8,10 @@ element-by-element against the `sdfr` view of the original.
 
 The conversion is designed lossless (datatypes preserved, no recompression),
 so the default check is exact elementwise equality INCLUDING dtype;
-`--rtol` loosens only for deliberate dtype experiments.
+`--rtol` loosens only for deliberate dtype experiments. Exception: openPMD
+*attributes* (grid node axes) are compared by value plus the converter's
+`sdf_grid_dtype` provenance stamp, because openpmd-api <=0.17 python returns
+array attributes as plain lists and hides their stored type.
 
 usage:
     validate_conversion.py 0000.sdf 0001.sdf --series /path/to/opmd
@@ -235,6 +238,38 @@ class Cmp:
         if self.verbose:
             print(f"    ok {name} {a.shape} {a.dtype}")
 
+    def eq_values(self, name, a, b):
+        """Elementwise equality ignoring dtype - for openPMD *attributes*
+        only. openpmd-api <=0.17 python hands array attributes back as plain
+        lists, so their stored type is invisible from python (bpls sees it
+        fine). Storage dtype is provenance-checked through the converter's
+        stamps instead, and widening to double is exact, so the values are
+        still compared exactly."""
+        a, b = np.asarray(a), np.asarray(b)
+        if a.shape != b.shape:
+            self.fails.append(f"{name}: shape SDF {a.shape} vs "
+                              f"openPMD {b.shape}")
+            return
+        if a.dtype.kind in "iu" and b.dtype.kind in "iu":
+            ok = np.array_equal(a, b)
+        elif a.dtype.kind in "iuf" and b.dtype.kind in "iuf":
+            ok = np.array_equal(a.astype(np.float64), b.astype(np.float64))
+        else:
+            ok = np.array_equal(a, b)
+        if not ok:
+            af = a.astype(np.float64) if a.dtype.kind in "iuf" else a
+            bf = b.astype(np.float64) if b.dtype.kind in "iuf" else b
+            diff = np.flatnonzero(af != bf)
+            ia = np.unravel_index(int(diff[0]), a.shape) if diff.size else ()
+            self.fails.append(f"{name}: values differ, {diff.size}/{a.size} "
+                              f"elements, first at {ia}: "
+                              f"{a[ia]!r} vs {b[ia]!r}")
+            return
+        self.n_ok += 1
+        if self.verbose:
+            print(f"    ok {name} {a.shape} (values; attribute dtype not "
+                  "exposed by this openpmd-api)")
+
 
 def validate_file(sdf_path, series, cmp, dump=None):
     tag = os.path.basename(sdf_path)
@@ -350,13 +385,29 @@ def validate_file(sdf_path, series, cmp, dump=None):
         axes = read_block(ids[gid], gid, "grid", axes=True)
         if axes is None:
             continue
+        # provenance: the mesh must record the datatype its grid had in SDF
+        sdt = {1: "int32", 2: "int64", 3: "float32", 4: "float64"}.get(
+            int(ids[gid]._contents.datatype))
+        if sdt is not None:
+            if rec.contains_attribute("sdf_grid_dtype"):
+                got = str(rec.get_attribute("sdf_grid_dtype"))
+                if got != sdt:
+                    cmp.fails.append(
+                        f"step {step}: mesh '{mname}' grid is stored as "
+                        f"{sdt} in SDF but the series says {got!r} "
+                        "(grid storage type not preserved)")
+                else:
+                    cmp.n_ok += 1
+            else:
+                cmp.skip(f"step {step} mesh '{mname}' grid dtype",
+                         "no sdf_grid_dtype stamp (older converter)")
         for lbl, axis in zip(rec.axis_labels, axes):
             if lbl not in have:
                 cmp.fails.append(f"step {step}: mesh '{mname}' lacks "
                                  f"sdf_axis_{lbl}")
                 continue
-            cmp.eq(f"step {step} grid '{gid}' axis {lbl}", axis,
-                   rec.get_attribute(f"sdf_axis_{lbl}"))
+            cmp.eq_values(f"step {step} grid '{gid}' axis {lbl}", axis,
+                          rec.get_attribute(f"sdf_axis_{lbl}"))
     for bid in sorted(grids - set(mesh_grid.values())):
         cmp.skip(f"step {step} grid '{bid}' axes",
                  "no converted field lives on it")

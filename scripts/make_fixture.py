@@ -76,6 +76,10 @@ def f8(x):
     return struct.pack("<d", x)
 
 
+def f4(x):
+    return struct.pack("<f", x)
+
+
 def i4(x):
     return struct.pack("<i", x)
 
@@ -163,6 +167,8 @@ def point_var_meta(npoints, mesh, species, units=""):
 def constant_meta(value, datatype):
     if datatype == DT_REAL8:
         return f8(value)
+    if datatype == DT_REAL4:
+        return f4(value)
     if datatype == DT_INT4:
         return i4(value)
     if datatype == DT_INT8:
@@ -361,6 +367,49 @@ def make_2d(step):
     return blocks
 
 
+def make_r4grid(step):
+    """EPOCH may store both the grid and the fields in single precision
+    (r4 dumps). Regression guard for the audit attributes: sdf_axis_* must
+    come out float32, not widened to float64."""
+    gx = [0.25 * i for i in range(5)]
+    gy = [1.5 + 0.5 * j for j in range(4)]
+    gz = [-0.5 + 0.25 * k for k in range(3)]
+    blocks = [
+        Block("general_grid", "general mesh", PLAIN_MESH, DT_REAL4, 3,
+              plain_mesh_meta([5, 4, 3]),
+              b"".join(f4(v) for v in gx)
+              + b"".join(f4(v) for v in gy)
+              + b"".join(f4(v) for v in gz)),
+    ]
+    # r4 field (staggered) alongside an r8 one: mixed dtypes in one file
+    blocks.append(
+        Block("ex", "Ex field", PLAIN_VARIABLE, DT_REAL4, 3,
+              plain_var_meta([4, 3, 2], "general_grid", "V/m", 1),
+              b"".join(f4(step * 100.0 + i + 3.0 * j + 7.0 * k)
+                       for k in range(2) for j in range(3) for i in range(4))))
+    blocks.append(
+        Block("rho", "charge density", PLAIN_VARIABLE, DT_REAL8, 3,
+              plain_var_meta([4, 3, 2], "general_grid", "C/m^3", 7),
+              b"".join(f8(step * 7.0 + i * 0.5 + j + 2.0 * k)
+                       for k in range(2) for j in range(3) for i in range(4))))
+    blocks.append(Block("dt", "timestep", CONSTANT, DT_REAL4, 0,
+                        constant_meta(2.5e-17, DT_REAL4)))
+
+    npart = 11
+    blocks.append(
+        Block("grid_el", "grid of electrons", POINT_MESH, DT_INT8, 1,
+              point_mesh_meta(npart, "el"), b"".join(i8(0) for _ in range(npart))))
+    for suffix, fn in (("x", lambda p: 0.5 * p), ("y", lambda p: -0.25 * p),
+                       ("z", lambda p: p / 4.0), ("px", lambda p: p + 0.5),
+                       ("py", lambda p: p + 1.5), ("pz", lambda p: p + 2.5),
+                       ("w", lambda p: 8.0)):
+        blocks.append(
+            Block(f"{suffix}_el", f"electron {suffix}", POINT_VARIABLE,
+                  DT_REAL4, 1, point_var_meta(npart, "grid_el", "el"),
+                  b"".join(f4(fn(p)) for p in range(npart))))
+    return blocks
+
+
 def main():
     out = sys.argv[1]
     os.makedirs(out, exist_ok=True)
@@ -369,6 +418,8 @@ def main():
     write_sdf(os.path.join(out, "0001.sdf"), 1, 1.5e-15, make_3d(1))
     write_sdf(os.path.join(out, "0002.sdf"), 2, 3.0e-15, make_3d(2),
               with_summary=False)
+    # single-precision grid + mixed r4/r8 fields (audit dtype guard)
+    write_sdf(os.path.join(out, "0003.sdf"), 3, 4.5e-15, make_r4grid(3))
     write_sdf(os.path.join(out, "1001.sdf"), 1001, 0.25, make_2d(1001))
     print(f"fixtures written to {out}")
 

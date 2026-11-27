@@ -51,6 +51,11 @@ setMetaAttr(Attributable & a, std::string const & name, MetaValue const & mv)
 struct Axis
 {
     std::vector<double> nodes;
+    /* Exact source values, kept for the sdf_axis_* audit attributes so the
+     * converted series preserves the SDF grid datatype (EPOCH may write the
+     * grid in r4 while all internal geometry math is double). */
+    std::vector<float> nodes_f4;
+    std::vector<int64_t> nodes_i8;
     double spacing = 1.0;
     double offset = 0.0;
     bool uniform = true;
@@ -62,6 +67,7 @@ struct MeshGeom
     std::vector<Axis> axes; // size = ndims
     int ndims = 3;
     bool valid = false;
+    std::string grid_dtype = "float64"; // SDF storage type of the grid block
 };
 
 MeshGeom
@@ -81,14 +87,33 @@ readMeshGeom(SdfFile & file, sdf_block_t * mb)
     geom.axes.resize(geom.ndims);
     geom.valid = true;
 
-    auto nodes = [&] {
-        if (mb->datatype == SDF_DATATYPE_REAL4)
-        {
-            auto f4 = readWhole<float>(file, *mb);
-            return std::vector<double>(f4.begin(), f4.end());
-        }
-        return readWhole<double>(file, *mb);
-    }();
+    std::vector<double> nodes;
+    std::vector<float> raw_f4;
+    std::vector<int64_t> raw_i8;
+    switch (mb->datatype)
+    {
+    case SDF_DATATYPE_REAL4: {
+        geom.grid_dtype = "float32";
+        raw_f4 = readWhole<float>(file, *mb);
+        nodes.assign(raw_f4.begin(), raw_f4.end());
+        break;
+    }
+    case SDF_DATATYPE_REAL8:
+        geom.grid_dtype = "float64";
+        nodes = readWhole<double>(file, *mb);
+        break;
+    case SDF_DATATYPE_INTEGER8: {
+        geom.grid_dtype = "int64";
+        raw_i8 = readWhole<int64_t>(file, *mb);
+        nodes.assign(raw_i8.begin(), raw_i8.end());
+        break;
+    }
+    default:
+        throw std::runtime_error(
+            "unsupported datatype (" + std::to_string(mb->datatype)
+            + ") for grid block '" + (mb->id ? mb->id : "?")
+            + "': grids must be real4, real8 or integer8");
+    }
 
     size_t pos = 0;
     for (int d = 0; d < geom.ndims; ++d)
@@ -98,6 +123,11 @@ readMeshGeom(SdfFile & file, sdf_block_t * mb)
         if (pos + len > nodes.size())
             throw std::runtime_error("mesh block data shorter than dims");
         ax.nodes.assign(nodes.begin() + pos, nodes.begin() + pos + len);
+        if (!raw_f4.empty())
+            ax.nodes_f4.assign(raw_f4.begin() + pos, raw_f4.begin() + pos + len);
+        if (!raw_i8.empty())
+            ax.nodes_i8.assign(raw_i8.begin() + pos,
+                raw_i8.begin() + pos + len);
         pos += len;
 
         if (mb->dim_labels && d < mb->ndim_labels && mb->dim_labels[d])
@@ -160,13 +190,24 @@ applyGeom(Mesh & mesh, MeshGeom const & geom, std::string const & sdfMeshId)
         mesh.setAttribute("sdf_nonuniform_grid", true);
     if (!sdfMeshId.empty())
         mesh.setAttribute("sdf_mesh_id", sdfMeshId);
+    if (geom.valid)
+        mesh.setAttribute("sdf_grid_dtype", geom.grid_dtype);
 
-    // Full axes for non-uniform or audit-hungry consumers (small cost).
+    // Full axes for non-uniform or audit-hungry consumers (small cost), in
+    // the datatype the SDF file stored them in: widening to double here
+    // would silently destroy the provenance of an r4 grid.
     for (int d = 0; d < nd; ++d)
     {
         auto const & ax = geom.axes[d];
-        if (!ax.nodes.empty() && ax.nodes.size() <= (1u << 22))
-            mesh.setAttribute("sdf_axis_" + ax.label, ax.nodes);
+        if (ax.nodes.empty() || ax.nodes.size() > (1u << 22))
+            continue;
+        std::string const key = "sdf_axis_" + ax.label;
+        if (!ax.nodes_f4.empty())
+            mesh.setAttribute(key, ax.nodes_f4);
+        else if (!ax.nodes_i8.empty())
+            mesh.setAttribute(key, ax.nodes_i8);
+        else
+            mesh.setAttribute(key, ax.nodes);
     }
 }
 
